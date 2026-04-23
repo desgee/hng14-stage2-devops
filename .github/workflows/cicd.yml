@@ -36,6 +36,7 @@ jobs:
 
       - name: flake8 — API
         run: flake8 api/main.py --max-line-length=100 --extend-ignore=E203
+        
 
       - name: flake8 — Worker
         run: flake8 worker/worker.py --max-line-length=100 --extend-ignore=E203
