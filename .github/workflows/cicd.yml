@@ -1,11 +1,3 @@
-
-##  CI/CD Pipeline
-##  Stages (strict order): lint → test → build → scan → integration → deploy
-##
-##  Every stage has `needs:` pointing at the previous one, so a failure
-##  anywhere stops all downstream stages automatically.
-
-
 name: CI/CD
 
 on:
@@ -14,9 +6,6 @@ on:
   pull_request:
     branches: [main]
 
-## ---------------------------------------------------------------------------
-## Shared values reused across jobs
-## ---------------------------------------------------------------------------
 env:
   REGISTRY: localhost:5000          
   IMAGE_API:      localhost:5000/api
@@ -25,9 +14,6 @@ env:
   PYTHON_VERSION: "3.12"
   NODE_VERSION:   "20"
 
-## ============================================================================
-## 1. LINT
-## ============================================================================
 jobs:
   lint:
     name: "1 · Lint"
@@ -93,10 +79,6 @@ jobs:
       - name: hadolint — frontend/Dockerfile
         run: hadolint frontend/Dockerfile
 
-
-## ============================================================================
-## 2. TEST
-## ============================================================================
   test:
     name: "2 · Unit Tests + Coverage"
     runs-on: ubuntu-latest
@@ -115,7 +97,7 @@ jobs:
         run: pip install -r app/tests/requirements-test.txt
 
       - name: Run pytest with coverage
-        # sys.path needs app/ so `from main import app` resolves
+       
         run: |
           PYTHONPATH=app pytest \
             --cov=app \
@@ -127,7 +109,7 @@ jobs:
 
       - name: Upload coverage XML
         uses: actions/upload-artifact@v4
-        if: always()           # upload even when coverage threshold fails
+        if: always()           
         with:
           name: coverage-report
           path: |
@@ -135,16 +117,11 @@ jobs:
             coverage-html/
           retention-days: 14
 
-
-## ============================================================================
-## 3. BUILD  (pushes to a local registry service container)
-## ============================================================================
   build:
     name: "3 · Build & Push Images"
     runs-on: ubuntu-latest
     needs: test
 
-    ## Local registry — only reachable inside this job
     services:
       registry:
         image: registry:2
@@ -157,9 +134,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
-          driver-opts: network=host   # lets buildx reach localhost:5000
-
-      ## Build each image and push both :<sha> and :latest tags
+          driver-opts: network=host   
+      
       - name: Build & push — API
         uses: docker/build-push-action@v5
         with:
@@ -195,8 +171,7 @@ jobs:
             ${{ env.IMAGE_FRONTEND }}:latest
           cache-from: type=gha
           cache-to:   type=gha,mode=max
-
-      ## Save the SHA so downstream jobs can pull the exact same tags
+  
       - name: Export image SHA
         run: echo "${{ github.sha }}" > image-sha.txt
 
@@ -206,23 +181,19 @@ jobs:
           name: image-sha
           path: image-sha.txt
 
-
-## ============================================================================
-## 4. SECURITY SCAN  (Trivy — fail on CRITICAL)
-## ============================================================================
   security-scan:
     name: "4 · Security Scan (Trivy)"
     runs-on: ubuntu-latest
     needs: build
 
-    ## Spin up the same local registry so we can pull the images we just built
+    
     services:
       registry:
         image: registry:2
         ports:
           - 5000:5000
 
-    ## Required so SARIF results can be uploaded to GitHub Security tab
+    
     permissions:
       security-events: write
       contents: read
@@ -239,8 +210,7 @@ jobs:
         id: sha
         run: echo "value=$(cat image-sha.txt)" >> "$GITHUB_OUTPUT"
 
-      ## Rebuild images into this job's local daemon so Trivy can scan them.
-      ## (The local registry doesn't persist between jobs.)
+    
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -273,7 +243,7 @@ jobs:
           tags: ${{ env.IMAGE_FRONTEND }}:${{ steps.sha.outputs.value }}
           cache-from: type=gha
 
-      ## Scan each image; exit-code 1 = CRITICAL found → pipeline fails
+      
       - name: Trivy scan — API
         uses: aquasecurity/trivy-action@master
         with:
@@ -304,13 +274,13 @@ jobs:
           exit-code:     "1"
           ignore-unfixed: true
 
-      ## Always upload SARIF — even if a scan found something — so the results
-      ## appear in GitHub Security → Code Scanning before the job is marked failed.
+      
+      
       - name: Upload SARIF results
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: "."     # uploads all *.sarif files in the workspace
+          sarif_file: "."     
 
       - name: Upload SARIF artifacts
         uses: actions/upload-artifact@v4
@@ -320,20 +290,15 @@ jobs:
           path: "*.sarif"
           retention-days: 14
 
-
-## ============================================================================
-## 5. INTEGRATION TEST
-## ============================================================================
   integration-test:
     name: "5 · Integration Test"
     runs-on: ubuntu-latest
     needs: security-scan
-
     steps:
       - uses: actions/checkout@v4
 
       - name: Create .env for docker compose
-        ## Secrets come from GitHub Actions secrets — nothing is hardcoded.
+        
         run: |
           cat > .env <<EOF
           REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
@@ -343,7 +308,7 @@ jobs:
           FRONTEND_PORT=3000
           EOF
 
-      ## Build fresh from source (no registry dependency across jobs)
+      
       - name: Build all images
         run: docker compose build
 
@@ -351,10 +316,10 @@ jobs:
         run: docker compose up -d
 
       - name: Wait for all services to be healthy
-        ## Poll docker compose ps until every service shows (healthy).
-        ## Fail after 170s so the job doesn't hang on broken images.
+        
+        
         run: |
-          TIMEOUT=120
+          TIMEOUT=100
           ELAPSED=0
           until docker compose ps | grep -v "healthy" | grep -qv "^NAME"; do
             ALL_HEALTHY=$(docker compose ps --format json \
@@ -390,12 +355,12 @@ jobs:
           POLL_TIMEOUT: "30"
         run: python scripts/integration_test.py
 
-      ## Always tear down — even if the test above failed
+      
       - name: Tear down stack
         if: always()
         run: docker compose down -v --remove-orphans
 
-      ## Capture logs as an artifact for debugging failures
+      
       - name: Capture compose logs
         if: always()
         run: docker compose logs --no-color > compose-logs.txt 2>&1 || true
@@ -409,17 +374,13 @@ jobs:
           retention-days: 7
 
 
-## ============================================================================
-## 6. DEPLOY  (main branch only — rolling update)
-## ============================================================================
   deploy:
     name: "6 · Deploy (rolling)"
     runs-on: ubuntu-latest
     needs: integration-test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
-    ## Concurrency guard: only one deploy runs at a time; a newer push cancels
-    ## a queued (but not in-progress) deploy.
+   
     concurrency:
       group: deploy-production
       cancel-in-progress: false
@@ -431,7 +392,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      ## Log in to the production container registry
+      
       - name: Log in to registry
         uses: docker/login-action@v3
         with:
@@ -439,7 +400,7 @@ jobs:
           username: ${{ secrets.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
-      ## Tag and push the images that passed every gate to the production registry
+      
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -462,11 +423,7 @@ jobs:
               .
           done
 
-      ## SSH into the production host and perform a rolling update for each service.
-      ## The rolling_deploy.sh script starts the new container, waits up to 60 s
-      ## for it to pass its HEALTHCHECK, then removes the old container.
-      ## If the health check never passes, the script exits non-zero and the old
-      ## container is left running — zero downtime on failure.
+      
       - name: Rolling deploy via SSH
         uses: appleboy/ssh-action@v1
         with:
