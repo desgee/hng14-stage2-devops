@@ -7,7 +7,6 @@ on:
     branches: [main]
 
 env:
-  
   REGISTRY:       localhost:5000
   IMAGE_API:      localhost:5000/api
   IMAGE_WORKER:   localhost:5000/worker
@@ -25,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Python: flake8 
+      # Python: flake8
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -41,7 +40,7 @@ jobs:
       - name: flake8 — Worker
         run: flake8 worker/worker.py --max-line-length=100 --extend-ignore=E203
 
-      # JavaScript: ESLint 
+      # JavaScript: ESLint
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -59,7 +58,7 @@ jobs:
         working-directory: frontend
         run: npx eslint app.js
 
-      #  Dockerfiles: hadolint 
+      # Dockerfiles: hadolint
       - name: Install hadolint
         run: |
           curl -sSL \
@@ -183,7 +182,6 @@ jobs:
           path: image-sha.txt
 
 
-
   security-scan:
     name: "4 · Security Scan (Trivy)"
     runs-on: ubuntu-latest
@@ -283,7 +281,6 @@ jobs:
           name: trivy-sarif
           path: "*.sarif"
           retention-days: 14
-
 
 
   integration-test:
@@ -427,7 +424,6 @@ jobs:
           retention-days: 7
 
 
-
   deploy:
     name: "6 · Deploy (rolling)"
     runs-on: ubuntu-latest
@@ -485,7 +481,6 @@ jobs:
             -t ${{ env.IMAGE_FRONTEND }}:latest \
             .
 
-      
       - name: Start simulated "old" production containers
         run: |
           # Create a shared network for the containers
@@ -509,7 +504,6 @@ jobs:
           echo "Old containers started. Current state:"
           docker ps --filter "name=api"
 
-      
       - name: Rolling deploy — API
         env:
           HEALTH_TIMEOUT: "60"
