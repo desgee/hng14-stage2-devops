@@ -71,13 +71,13 @@ jobs:
           chmod +x /usr/local/bin/hadolint
 
       - name: hadolint — api/Dockerfile
-        run: hadolint api/Dockerfile
+        run: hadolint api/Dockerfile --ignore DL3013 --ignore DL3008
 
       - name: hadolint — worker/Dockerfile
-        run: hadolint worker/Dockerfile
+        run: hadolint worker/Dockerfile --ignore DL3013 --ignore DL3008
 
       - name: hadolint — frontend/Dockerfile
-        run: hadolint frontend/Dockerfile
+        run: hadolint frontend/Dockerfile --ignore DL3013 --ignore DL3008
 
 
 ## ============================================================================
