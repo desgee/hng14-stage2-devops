@@ -42,7 +42,7 @@ def create_job():
 def get_job(job_id: str):
     
     if not UUID_RE.match(job_id):
-        raise HTTPException(status_code=400, detail="Invalid job ID format")
+        raise HTTPException(status_code=400, detail="Invalid job ID")
 
     status = r.hget(f"job:{job_id}", "status")
     if not status:
