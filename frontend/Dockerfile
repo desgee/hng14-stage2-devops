@@ -4,7 +4,7 @@ FROM node:20-slim AS deps
 WORKDIR /build
 
 COPY frontend/package.json ./
-COPY frontend/package-lock.json ./        # ← also needs this for npm ci
+COPY frontend/package-lock.json ./
 
 RUN npm ci --omit=dev
 

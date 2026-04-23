@@ -1,0 +1,497 @@
+
+##  CI/CD Pipeline
+##  Stages (strict order): lint → test → build → scan → integration → deploy
+##
+##  Every stage has `needs:` pointing at the previous one, so a failure
+##  anywhere stops all downstream stages automatically.
+
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+## ---------------------------------------------------------------------------
+## Shared values reused across jobs
+## ---------------------------------------------------------------------------
+env:
+  REGISTRY: localhost:5000          
+  IMAGE_API:      localhost:5000/api
+  IMAGE_WORKER:   localhost:5000/worker
+  IMAGE_FRONTEND: localhost:5000/frontend
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION:   "20"
+
+## ============================================================================
+## 1. LINT
+## ============================================================================
+jobs:
+  lint:
+    name: "1 · Lint"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      ## ── Python: flake8 ───────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: flake8 — API
+        run: |
+          flake8 app/main.py \
+            --max-line-length=100 \
+            --extend-ignore=E203
+
+      - name: flake8 — Worker
+        run: |
+          flake8 worker/worker.py \
+            --max-line-length=100 \
+            --extend-ignore=E203
+
+      ## ── JavaScript: ESLint ───────────────────────────────────────────────
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install ESLint + config
+        working-directory: frontend
+        run: |
+          npm ci
+          npm install --save-dev eslint @eslint/js
+
+      - name: ESLint — frontend
+        working-directory: frontend
+        run: npx eslint app.js
+
+      ## ── Dockerfiles: hadolint ────────────────────────────────────────────
+      - name: Install hadolint
+        run: |
+          curl -sSL \
+            https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64 \
+            -o /usr/local/bin/hadolint
+          chmod +x /usr/local/bin/hadolint
+
+      - name: hadolint — app/Dockerfile
+        run: hadolint app/Dockerfile
+
+      - name: hadolint — worker/Dockerfile
+        run: hadolint worker/Dockerfile
+
+      - name: hadolint — frontend/Dockerfile
+        run: hadolint frontend/Dockerfile
+
+
+## ============================================================================
+## 2. TEST
+## ============================================================================
+  test:
+    name: "2 · Unit Tests + Coverage"
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install -r app/tests/requirements-test.txt
+
+      - name: Run pytest with coverage
+        # sys.path needs app/ so `from main import app` resolves
+        run: |
+          PYTHONPATH=app pytest \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:coverage-html \
+            --cov-fail-under=80 \
+            -v
+
+      - name: Upload coverage XML
+        uses: actions/upload-artifact@v4
+        if: always()           # upload even when coverage threshold fails
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            coverage-html/
+          retention-days: 14
+
+
+## ============================================================================
+## 3. BUILD  (pushes to a local registry service container)
+## ============================================================================
+  build:
+    name: "3 · Build & Push Images"
+    runs-on: ubuntu-latest
+    needs: test
+
+    ## Local registry — only reachable inside this job
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host   # lets buildx reach localhost:5000
+
+      ## Build each image and push both :<sha> and :latest tags
+      - name: Build & push — API
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: app/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_API }}:${{ github.sha }}
+            ${{ env.IMAGE_API }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Build & push — Worker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: worker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_WORKER }}:${{ github.sha }}
+            ${{ env.IMAGE_WORKER }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Build & push — Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_FRONTEND }}:${{ github.sha }}
+            ${{ env.IMAGE_FRONTEND }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      ## Save the SHA so downstream jobs can pull the exact same tags
+      - name: Export image SHA
+        run: echo "${{ github.sha }}" > image-sha.txt
+
+      - name: Upload image SHA
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-sha
+          path: image-sha.txt
+
+
+## ============================================================================
+## 4. SECURITY SCAN  (Trivy — fail on CRITICAL)
+## ============================================================================
+  security-scan:
+    name: "4 · Security Scan (Trivy)"
+    runs-on: ubuntu-latest
+    needs: build
+
+    ## Spin up the same local registry so we can pull the images we just built
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+
+    ## Required so SARIF results can be uploaded to GitHub Security tab
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image SHA
+        uses: actions/download-artifact@v4
+        with:
+          name: image-sha
+
+      - name: Read SHA
+        id: sha
+        run: echo "value=$(cat image-sha.txt)" >> "$GITHUB_OUTPUT"
+
+      ## Rebuild images into this job's local daemon so Trivy can scan them.
+      ## (The local registry doesn't persist between jobs.)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Rebuild — API (into local daemon)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: app/Dockerfile
+          load: true
+          tags: ${{ env.IMAGE_API }}:${{ steps.sha.outputs.value }}
+          cache-from: type=gha
+
+      - name: Rebuild — Worker (into local daemon)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: worker/Dockerfile
+          load: true
+          tags: ${{ env.IMAGE_WORKER }}:${{ steps.sha.outputs.value }}
+          cache-from: type=gha
+
+      - name: Rebuild — Frontend (into local daemon)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: frontend/Dockerfile
+          load: true
+          tags: ${{ env.IMAGE_FRONTEND }}:${{ steps.sha.outputs.value }}
+          cache-from: type=gha
+
+      ## Scan each image; exit-code 1 = CRITICAL found → pipeline fails
+      - name: Trivy scan — API
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:     "${{ env.IMAGE_API }}:${{ steps.sha.outputs.value }}"
+          format:        sarif
+          output:        trivy-api.sarif
+          severity:      CRITICAL
+          exit-code:     "1"
+          ignore-unfixed: true
+
+      - name: Trivy scan — Worker
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:     "${{ env.IMAGE_WORKER }}:${{ steps.sha.outputs.value }}"
+          format:        sarif
+          output:        trivy-worker.sarif
+          severity:      CRITICAL
+          exit-code:     "1"
+          ignore-unfixed: true
+
+      - name: Trivy scan — Frontend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:     "${{ env.IMAGE_FRONTEND }}:${{ steps.sha.outputs.value }}"
+          format:        sarif
+          output:        trivy-frontend.sarif
+          severity:      CRITICAL
+          exit-code:     "1"
+          ignore-unfixed: true
+
+      ## Always upload SARIF — even if a scan found something — so the results
+      ## appear in GitHub Security → Code Scanning before the job is marked failed.
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "."     # uploads all *.sarif files in the workspace
+
+      - name: Upload SARIF artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-sarif
+          path: "*.sarif"
+          retention-days: 14
+
+
+## ============================================================================
+## 5. INTEGRATION TEST
+## ============================================================================
+  integration-test:
+    name: "5 · Integration Test"
+    runs-on: ubuntu-latest
+    needs: security-scan
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env for docker compose
+        ## Secrets come from GitHub Actions secrets — nothing is hardcoded.
+        run: |
+          cat > .env <<EOF
+          REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+          REDIS_MAX_MEMORY=64mb
+          APP_ENV=ci
+          ALLOWED_ORIGIN=http://localhost:3000
+          FRONTEND_PORT=3000
+          EOF
+
+      ## Build fresh from source (no registry dependency across jobs)
+      - name: Build all images
+        run: docker compose build
+
+      - name: Start full stack
+        run: docker compose up -d
+
+      - name: Wait for all services to be healthy
+        ## Poll docker compose ps until every service shows (healthy).
+        ## Fail after 170s so the job doesn't hang on broken images.
+        run: |
+          TIMEOUT=120
+          ELAPSED=0
+          until docker compose ps | grep -v "healthy" | grep -qv "^NAME"; do
+            ALL_HEALTHY=$(docker compose ps --format json \
+              | python3 -c "
+          import sys, json
+          services = [json.loads(l) for l in sys.stdin if l.strip()]
+          unhealthy = [s['Service'] for s in services if s.get('Health','') not in ('healthy','')]
+          print('no' if unhealthy else 'yes')
+          ")
+            if [[ "${ALL_HEALTHY}" == "yes" ]]; then
+              echo "All services healthy."
+              break
+            fi
+            if [[ ${ELAPSED} -ge ${TIMEOUT} ]]; then
+              echo "Timed out waiting for healthy stack." >&2
+              docker compose ps
+              docker compose logs
+              exit 1
+            fi
+            echo "Waiting … ${ELAPSED}s"
+            sleep 5
+            ELAPSED=$(( ELAPSED + 5 ))
+          done
+
+      - name: Set up Python for integration test
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run integration test
+        env:
+          FRONTEND_URL: http://localhost:3000
+          POLL_TIMEOUT: "30"
+        run: python scripts/integration_test.py
+
+      ## Always tear down — even if the test above failed
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+      ## Capture logs as an artifact for debugging failures
+      - name: Capture compose logs
+        if: always()
+        run: docker compose logs --no-color > compose-logs.txt 2>&1 || true
+
+      - name: Upload compose logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compose-logs
+          path: compose-logs.txt
+          retention-days: 7
+
+
+## ============================================================================
+## 6. DEPLOY  (main branch only — rolling update)
+## ============================================================================
+  deploy:
+    name: "6 · Deploy (rolling)"
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    ## Concurrency guard: only one deploy runs at a time; a newer push cancels
+    ## a queued (but not in-progress) deploy.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+
+    environment:
+      name: production
+      url: ${{ secrets.PRODUCTION_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      ## Log in to the production container registry
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      ## Tag and push the images that passed every gate to the production registry
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push production images
+        run: |
+          for SERVICE in api worker frontend; do
+            case $SERVICE in
+              api)      DOCKERFILE=app/Dockerfile      ;;
+              worker)   DOCKERFILE=worker/Dockerfile   ;;
+              frontend) DOCKERFILE=frontend/Dockerfile ;;
+            esac
+
+            docker buildx build \
+              --push \
+              --cache-from type=gha \
+              --cache-to   type=gha,mode=max \
+              -f "${DOCKERFILE}" \
+              -t "${{ secrets.REGISTRY_HOST }}/${SERVICE}:${{ github.sha }}" \
+              -t "${{ secrets.REGISTRY_HOST }}/${SERVICE}:latest" \
+              .
+          done
+
+      ## SSH into the production host and perform a rolling update for each service.
+      ## The rolling_deploy.sh script starts the new container, waits up to 60 s
+      ## for it to pass its HEALTHCHECK, then removes the old container.
+      ## If the health check never passes, the script exits non-zero and the old
+      ## container is left running — zero downtime on failure.
+      - name: Rolling deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key:      ${{ secrets.DEPLOY_SSH_KEY }}
+          envs:     GITHUB_SHA
+          script: |
+            set -euo pipefail
+
+            cd /opt/app
+            export HEALTH_TIMEOUT=60
+            export COMPOSE_FILE=docker-compose.yml
+
+            for SERVICE in api worker frontend; do
+              echo "==> Rolling update: ${SERVICE}"
+              bash scripts/rolling_deploy.sh \
+                "${SERVICE}" \
+                "${{ secrets.REGISTRY_HOST }}/${SERVICE}:${GITHUB_SHA}"
+            done
+
+            echo "==> Deploy complete."
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Deploy to production FAILED for commit ${{ github.sha }}. \
+          The old containers are still running."
