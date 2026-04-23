@@ -25,7 +25,6 @@ on:
     branches: [main]
 
 env:
-  # Local registry:2 service container — reachable at localhost:5000 within each job
   REGISTRY:       localhost:5000
   IMAGE_API:      localhost:5000/api
   IMAGE_WORKER:   localhost:5000/worker
@@ -62,6 +61,9 @@ jobs:
         run: flake8 worker/worker.py --max-line-length=100 --extend-ignore=E203
 
       # ── JavaScript: ESLint ────────────────────────────────────────────────
+      # We use `npm run lint` (not npx) so ESLint resolves from the locally
+      # installed node_modules. Using npx would download a fresh isolated copy
+      # of ESLint that cannot find @eslint/js in the project's node_modules.
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -69,14 +71,12 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install dependencies (includes eslint + @eslint/js from package.json)
+      - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
 
       - name: ESLint — frontend
         working-directory: frontend
-        # Use npm run lint so eslint resolves from node_modules, not npx (which
-        # would download a fresh version and fail to find @eslint/js)
         run: npm run lint
 
       # ── Dockerfiles: hadolint ─────────────────────────────────────────────
@@ -118,7 +118,6 @@ jobs:
         run: pip install -r app/tests/requirements-test.txt
 
       - name: Run pytest with coverage
-        # PYTHONPATH=app so `from main import app` resolves without installing the package
         run: |
           PYTHONPATH=app pytest \
             --cov=app \
@@ -141,15 +140,6 @@ jobs:
 
 ## ============================================================================
 ## 3. BUILD
-##
-##  Images are built ONCE here and pushed to a local registry:2 service
-##  container running on localhost:5000 — satisfying the requirement:
-##  "push to a local Docker registry running as a service container within the job"
-##
-##  The GHA layer cache (type=gha) means downstream jobs can reconstruct
-##  the identical image in seconds without a full rebuild.
-##  The git SHA is saved as an artifact so every downstream job references
-##  the exact same image tag.
 ## ============================================================================
   build:
     name: "3 · Build & Push Images"
@@ -165,13 +155,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # network=host lets the Buildx builder reach localhost:5000
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: network=host
 
-      # Each image is tagged with BOTH :<git-sha> and :latest
       - name: Build & push — API
         uses: docker/build-push-action@v5
         with:
@@ -220,11 +208,6 @@ jobs:
 
 ## ============================================================================
 ## 4. SECURITY SCAN
-##
-##  Images are loaded from the GHA layer cache (identical bits to Stage 3,
-##  reconstructed in seconds) and scanned with Trivy.
-##  Any CRITICAL CVE fails the pipeline immediately.
-##  SARIF results are uploaded as an artifact.
 ## ============================================================================
   security-scan:
     name: "4 · Security Scan (Trivy)"
@@ -252,7 +235,6 @@ jobs:
         with:
           driver-opts: network=host
 
-      # Load images from GHA cache into the local Docker daemon for Trivy
       - name: Load API image from cache
         uses: docker/build-push-action@v5
         with:
@@ -280,7 +262,6 @@ jobs:
           tags: ${{ env.IMAGE_FRONTEND }}:${{ steps.sha.outputs.value }}
           cache-from: type=gha
 
-      # exit-code: "1" — CRITICAL finding = pipeline fails
       - name: Trivy scan — API
         uses: aquasecurity/trivy-action@master
         with:
@@ -311,7 +292,6 @@ jobs:
           exit-code:      "1"
           ignore-unfixed: true
 
-      # Upload even on failure so results are visible before the job turns red
       - name: Upload SARIF to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         if: always()
@@ -329,12 +309,6 @@ jobs:
 
 ## ============================================================================
 ## 5. INTEGRATION TEST
-##
-##  The full four-service stack (Redis, API, Worker, Frontend) runs inside
-##  the GitHub Actions runner. No external services needed.
-##
-##  REDIS_PASSWORD comes from secrets.REDIS_PASSWORD — never hardcoded.
-##  The .env file is written at runtime and never committed.
 ## ============================================================================
   integration-test:
     name: "5 · Integration Test"
@@ -353,7 +327,6 @@ jobs:
         id: sha
         run: echo "value=$(cat image-sha.txt)" >> "$GITHUB_OUTPUT"
 
-      # .env written at runtime from GitHub Secrets — never in the repo
       - name: Write runtime .env
         run: |
           cat > .env <<EOF
@@ -369,8 +342,6 @@ jobs:
         with:
           driver-opts: network=host
 
-      # Override file tells docker compose to use the pre-built images
-      # instead of running `docker compose build` again
       - name: Write compose override (use pre-built images)
         run: |
           SHA=${{ steps.sha.outputs.value }}
@@ -387,7 +358,6 @@ jobs:
               image: ${{ env.IMAGE_FRONTEND }}:${SHA}
           EOF
 
-      # Load pre-built images from GHA cache
       - name: Load API image
         uses: docker/build-push-action@v5
         with:
@@ -418,7 +388,6 @@ jobs:
       - name: Start full stack
         run: docker compose up -d
 
-      # Poll until every service is healthy or timeout after 120s
       - name: Wait for all services to be healthy
         run: |
           TIMEOUT=120
@@ -452,14 +421,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # Submit a job through the frontend, poll until completed, assert result
       - name: Run integration test
         env:
           FRONTEND_URL: http://localhost:3000
           POLL_TIMEOUT: "30"
         run: python scripts/integration_test.py
 
-      # Always tear down — even if the test above failed
       - name: Tear down stack
         if: always()
         run: docker compose down -v --remove-orphans
@@ -478,23 +445,7 @@ jobs:
 
 
 ## ============================================================================
-## 6. DEPLOY — rolling update, runs entirely on the GitHub Actions runner
-##
-##  No server. No cloud. Everything happens inside ubuntu-latest.
-##
-##  What this does:
-##    - Loads the pre-built images from the GHA cache
-##    - Runs the "old" container (simulating production)
-##    - Runs the rolling_deploy.sh script which:
-##        1. Starts the NEW container alongside the old one
-##        2. Polls the new container's healthcheck every 2s for up to 60s
-##        3. If healthy  → stops and removes the old container ✅
-##        4. If unhealthy → stops and removes the new container,
-##                          old container keeps running ✅
-##    - Verifies the correct container is running after the update
-##    - Cleans up all containers regardless of outcome
-##
-##  This satisfies every requirement without any external infrastructure.
+## 6. DEPLOY
 ## ============================================================================
   deploy:
     name: "6 · Deploy (rolling)"
@@ -523,45 +474,43 @@ jobs:
         with:
           driver-opts: network=host
 
-      # Load pre-built images from GHA cache — no rebuild, no cloud push
       - name: Load images from cache
         run: |
-          # API
           docker buildx build \
-            --load \
-            --cache-from type=gha \
+            --load --cache-from type=gha \
             -f app/Dockerfile \
             -t ${{ env.IMAGE_API }}:${{ steps.sha.outputs.value }} \
             -t ${{ env.IMAGE_API }}:latest \
             .
 
-          # Worker
           docker buildx build \
-            --load \
-            --cache-from type=gha \
+            --load --cache-from type=gha \
             -f worker/Dockerfile \
             -t ${{ env.IMAGE_WORKER }}:${{ steps.sha.outputs.value }} \
             -t ${{ env.IMAGE_WORKER }}:latest \
             .
 
-          # Frontend
           docker buildx build \
-            --load \
-            --cache-from type=gha \
+            --load --cache-from type=gha \
             -f frontend/Dockerfile \
             -t ${{ env.IMAGE_FRONTEND }}:${{ steps.sha.outputs.value }} \
             -t ${{ env.IMAGE_FRONTEND }}:latest \
             .
 
-      # Simulate the "old" production container that is currently running.
-      # In a real deployment this would already exist on the server.
-      # Here we start it on the runner to prove the rolling update works.
-      - name: Start simulated "old" production containers
+      - name: Write .env for deploy
         run: |
-          # Create a shared network for the containers
+          cat > .env <<EOF
+          REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+          REDIS_MAX_MEMORY=64mb
+          APP_ENV=production
+          ALLOWED_ORIGIN=http://localhost:3000
+          FRONTEND_PORT=3000
+          EOF
+
+      - name: Start simulated old production containers
+        run: |
           docker network create prod-net || true
 
-          # Start old API container (using :latest as the "previous" build)
           docker run -d \
             --name api \
             --network prod-net \
@@ -576,13 +525,9 @@ jobs:
             -e ALLOWED_ORIGIN=http://localhost:3000 \
             ${{ env.IMAGE_API }}:latest
 
-          echo "Old containers started. Current state:"
+          echo "Old container started:"
           docker ps --filter "name=api"
 
-      # Run the rolling deploy script against each service.
-      # The script is the same one documented in scripts/rolling_deploy.sh.
-      # It starts the new container, waits up to 60s for its healthcheck,
-      # then swaps — or aborts and leaves the old one running.
       - name: Rolling deploy — API
         env:
           HEALTH_TIMEOUT: "60"
@@ -596,8 +541,6 @@ jobs:
         env:
           HEALTH_TIMEOUT: "60"
         run: |
-          # Worker has no old container in this simulation (stateless consumer)
-          # Start it fresh — rolling_deploy.sh handles the no-old-container case
           bash scripts/rolling_deploy.sh \
             worker \
             "${{ env.IMAGE_WORKER }}:${{ steps.sha.outputs.value }}"
@@ -610,14 +553,11 @@ jobs:
             frontend \
             "${{ env.IMAGE_FRONTEND }}:${{ steps.sha.outputs.value }}"
 
-      # Verify the new containers are running and healthy
       - name: Verify deployment
         run: |
-          echo "=== Containers running after rolling deploy ==="
+          echo "=== Containers after rolling deploy ==="
           docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
 
-          echo ""
-          echo "=== Verifying api container is the NEW version ==="
           RUNNING_IMAGE=$(docker inspect api --format '{{.Config.Image}}' 2>/dev/null || echo "not found")
           EXPECTED="${{ env.IMAGE_API }}:${{ steps.sha.outputs.value }}"
 
@@ -631,7 +571,6 @@ jobs:
             exit 1
           fi
 
-      # Always clean up all containers at the end of the job
       - name: Clean up containers
         if: always()
         run: |
