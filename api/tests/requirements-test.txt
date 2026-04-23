@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-redis
-python-dotenv
-httpx
-pytest
-pytest-cov
