@@ -1,18 +1,471 @@
-Run npx eslint app.js
+name: CI/CD Pipeline
 
-Oops! Something went wrong! :(
+# ─────────────────────────────────────────────────────────────────
+# Triggers: runs on every push to any branch, and on pull requests
+# ─────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
-ESLint: 10.2.1
+# ══════════════════════════════════════════════════════════════════
+# STAGE 1 — LINT
+# Checks Python, JavaScript, and Dockerfiles for code quality.
+# Everything else is blocked until this passes.
+# ══════════════════════════════════════════════════════════════════
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-ESLint couldn't find an eslint.config.(js|mjs|cjs) file.
+      # ── Python linting (API + Worker) ──────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-From ESLint v9.0.0, the default configuration file is now eslint.config.js.
-If you are using a .eslintrc.* file, please follow the migration guide
-to update your configuration file to the new format:
+      - name: Install flake8
+        run: pip install flake8
 
-https://eslint.org/docs/latest/use/configure/migration-guide
+      - name: Lint API with flake8
+        run: flake8 api/ --max-line-length=120 --exclude=__pycache__,venv,.venv,env
 
-If you still have problems after following the migration guide, please stop by
-https://eslint.org/chat/help to chat with the team.
+      - name: Lint Worker with flake8
+        run: flake8 worker/ --max-line-length=120 --exclude=__pycache__,venv,.venv,env
 
-Error: Process completed with exit code 2.
+      # ── JavaScript linting (Frontend) ──────────────────────────
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci
+
+      - name: Lint frontend with ESLint
+        run: cd frontend && npx eslint . --ext .js --max-warnings=0
+
+      # ── Dockerfile linting ─────────────────────────────────────
+      - name: Lint frontend Dockerfile with hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
+
+      - name: Lint API Dockerfile with hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: api/Dockerfile
+
+      - name: Lint Worker Dockerfile with hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: worker/Dockerfile
+
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 2 — TEST
+# Runs pytest unit tests against the API.
+# Redis is mocked with fakeredis — no real Redis needed here.
+# Uploads a coverage report as a downloadable artifact.
+# ══════════════════════════════════════════════════════════════════
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install API dependencies and test tools
+        # httpx is required by FastAPI TestClient
+        # fakeredis mocks Redis so no real Redis server is needed
+        run: |
+          pip install pytest pytest-cov fakeredis "httpx==0.27.2"
+          pip install -r api/requirements.txt
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest api/tests/ \
+            --cov=api \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 3 — BUILD
+# Builds all 3 Docker images.
+# Tags each with the git SHA and "latest".
+# Pushes to your Docker Hub account using secrets.
+# ══════════════════════════════════════════════════════════════════
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # ── Frontend ───────────────────────────────────────────────
+      - name: Build and push frontend image
+        run: |
+          docker build \
+            -t ${{ secrets.DOCKER_USERNAME }}/hng14-frontend:${{ github.sha }} \
+            -t ${{ secrets.DOCKER_USERNAME }}/hng14-frontend:latest \
+            ./frontend
+          docker push ${{ secrets.DOCKER_USERNAME }}/hng14-frontend:${{ github.sha }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/hng14-frontend:latest
+
+      # ── API ────────────────────────────────────────────────────
+      - name: Build and push API image
+        run: |
+          docker build \
+            -t ${{ secrets.DOCKER_USERNAME }}/hng14-api:${{ github.sha }} \
+            -t ${{ secrets.DOCKER_USERNAME }}/hng14-api:latest \
+            ./api
+          docker push ${{ secrets.DOCKER_USERNAME }}/hng14-api:${{ github.sha }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/hng14-api:latest
+
+      # ── Worker ─────────────────────────────────────────────────
+      - name: Build and push worker image
+        run: |
+          docker build \
+            -t ${{ secrets.DOCKER_USERNAME }}/hng14-worker:${{ github.sha }} \
+            -t ${{ secrets.DOCKER_USERNAME }}/hng14-worker:latest \
+            ./worker
+          docker push ${{ secrets.DOCKER_USERNAME }}/hng14-worker:${{ github.sha }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/hng14-worker:latest
+
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 4 — SECURITY SCAN
+# Installs Trivy directly (no action wrapper — avoids known bug
+# where trivy-action exits code 1 despite zero vulnerabilities).
+# Fails on CRITICAL findings. Uploads SARIF as artifact.
+# ══════════════════════════════════════════════════════════════════
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.70.0
+
+      - name: Scan frontend image with Trivy
+        run: |
+          trivy image \
+            --severity CRITICAL \
+            --scanners vuln \
+            --ignore-unfixed \
+            --format sarif \
+            --output trivy-frontend.sarif \
+            --exit-code 1 \
+            ${{ secrets.DOCKER_USERNAME }}/hng14-frontend:${{ github.sha }}
+
+      - name: Scan API image with Trivy
+        run: |
+          trivy image \
+            --severity CRITICAL \
+            --scanners vuln \
+            --ignore-unfixed \
+            --format sarif \
+            --output trivy-api.sarif \
+            --exit-code 1 \
+            ${{ secrets.DOCKER_USERNAME }}/hng14-api:${{ github.sha }}
+
+      - name: Scan worker image with Trivy
+        run: |
+          trivy image \
+            --severity CRITICAL \
+            --scanners vuln \
+            --ignore-unfixed \
+            --format sarif \
+            --output trivy-worker.sarif \
+            --exit-code 1 \
+            ${{ secrets.DOCKER_USERNAME }}/hng14-worker:${{ github.sha }}
+
+      - name: Upload Trivy SARIF results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-sarif-results
+          path: |
+            trivy-frontend.sarif
+            trivy-api.sarif
+            trivy-worker.sarif
+          retention-days: 7
+        
+
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 5 — INTEGRATION TEST
+# Starts the full stack inside the GitHub runner.
+# Submits a real job through the frontend HTTP endpoint.
+# Polls every 5s until status = "completed" (max 60 seconds).
+# Tears down the stack cleanly regardless of test outcome.
+# ══════════════════════════════════════════════════════════════════
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Create .env from example
+        run: cp .env.example .env
+
+      - name: Pull images and start full stack
+        run: |
+          docker compose pull
+          docker compose up -d
+          echo "Stack started — waiting 30s for all services to become healthy..."
+          sleep 30
+
+      - name: Show container logs and status
+        run: |
+          echo "=== CONTAINER STATUS ==="
+          docker compose ps
+          echo "=== FRONTEND LOGS ==="
+          docker compose logs frontend
+          echo "=== API LOGS ==="
+          docker compose logs api
+          echo "=== REDIS LOGS ==="
+          docker compose logs redis
+
+      - name: Wait for frontend to be ready
+        run: |
+          echo "Checking frontend is responding..."
+          for i in $(seq 1 12); do
+            if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+              echo "Frontend ready after attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i: not ready yet, retrying in 5s..."
+            sleep 5
+          done
+          echo "FAILED — frontend never became ready"
+          docker compose logs frontend
+          exit 1
+
+      - name: Submit a job and poll until completed
+        run: |
+          echo "--- Submitting test job ---"
+
+          RESPONSE=$(curl -sf -X POST http://localhost:8000/jobs \
+            -H "Content-Type: application/json")
+
+          echo "Server response: $RESPONSE"
+
+          JOB_ID=$(echo "$RESPONSE" | python3 -c \
+            "import sys, json; print(json.load(sys.stdin)['job_id'])")
+
+          echo "Job ID: $JOB_ID"
+          echo "--- Polling for completion (max 60s) ---"
+
+          for i in $(seq 1 12); do
+            STATUS=$(curl -sf http://localhost:8000/jobs/$JOB_ID \
+              | python3 -c \
+              "import sys, json; print(json.load(sys.stdin)['status'])")
+
+            echo "Poll $i/12 — status: $STATUS"
+
+            if [ "$STATUS" = "completed" ]; then
+              echo "Integration test PASSED"
+              exit 0
+            fi
+
+            if [ "$STATUS" = "failed" ]; then
+              echo "Integration test FAILED — job returned failed status"
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          echo "Integration test FAILED — job timed out after 60 seconds"
+          exit 1
+
+      - name: Tear down stack (always runs even if test failed)
+        if: always()
+        run: |
+          docker compose down -v --remove-orphans
+          echo "Stack torn down cleanly"
+
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 6 — DEPLOY
+# Only runs on pushes to the main branch.
+# SSHes into your AWS Ubuntu EC2 server.
+# Performs a scripted rolling update:
+#   1. Pulls new image from Docker Hub
+#   2. Starts new container alongside the old one
+#   3. Waits up to 60 seconds for health check to pass
+#   4. HEALTHY  → stops old container, new one takes over
+#   5. UNHEALTHY → kills new container, old one keeps running
+# ══════════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Set up SSH to reach your AWS EC2 server ────────────────
+      - name: Configure SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      # ── All commands below run ON your AWS server via SSH ───────
+      - name: Run rolling deploy on AWS server
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              ubuntu@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+
+            set -e
+
+            echo "============================================"
+            echo "  Rolling deploy started"
+            echo "  SHA: ${{ github.sha }}"
+            echo "============================================"
+
+            # Navigate to the cloned repo on the server
+            cd /home/ubuntu/hng14-stage2-devops
+
+            # Pull the latest code from GitHub
+            git pull origin main
+
+            # Pull the freshly built images from Docker Hub
+            docker pull ${{ secrets.DOCKER_USERNAME }}/hng14-api:${{ github.sha }}
+            docker pull ${{ secrets.DOCKER_USERNAME }}/hng14-frontend:${{ github.sha }}
+            docker pull ${{ secrets.DOCKER_USERNAME }}/hng14-worker:${{ github.sha }}
+
+            # ─────────────────────────────────────────
+            # Rolling update: API
+            # Start new container, health check it,
+            # then swap — or abort if it stays unhealthy
+            # ─────────────────────────────────────────
+            echo "--- Rolling update: API ---"
+
+            # FORCE CLEAN OLD CONTAINER FIRST
+            
+            docker rm -f api-new 2>/dev/null || true
+
+            docker run -d \
+              --name api-new \
+              --network hng14-stage2-devops_app-network \
+              --env-file .env \
+              --health-cmd "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\"" \
+              --health-interval 10s \
+              --health-timeout 5s \
+              --health-retries 3 \
+              ${{ secrets.DOCKER_USERNAME }}/hng14-api:${{ github.sha }}
+
+            # Poll health check for up to 60 seconds
+            HEALTHY=false
+            for i in $(seq 1 12); do
+              HEALTH=$(docker inspect \
+                --format='{{.State.Health.Status}}' api-new 2>/dev/null \
+                || echo "starting")
+              echo "  Health check $i/12: $HEALTH"
+
+              if [ "$HEALTH" = "healthy" ]; then
+                HEALTHY=true
+                break
+              fi
+              sleep 5
+            done
+
+            # Swap or abort
+            if [ "$HEALTHY" = "true" ]; then
+              echo "  New API is healthy — switching traffic to new container"
+              docker stop api-old 2>/dev/null || true
+              docker rm   api-old 2>/dev/null || true
+              docker rename api-new api-old
+              echo "  API rolling update complete"
+            else
+              echo "  ABORT: new API failed health check within 60s"
+              echo "  Removing new container — old container continues running"
+              docker stop api-new 2>/dev/null || true
+              docker rm   api-new 2>/dev/null || true
+              exit 1
+            fi
+
+            # ─────────────────────────────────────────
+            # Update frontend and worker via compose
+            # (simpler services, no rolling needed)
+            # ─────────────────────────────────────────
+            echo "--- Updating frontend and worker ---"
+            docker stop frontend worker 2>/dev/null || true
+            docker rm frontend worker 2>/dev/null || true
+
+            docker run -d --name frontend \
+              --network hng14-stage2-devops_app-network \
+              -p 3000:3000 \
+              ${{ secrets.DOCKER_USERNAME }}/hng14-frontend:${{ github.sha }}
+
+            docker run -d --name worker \
+              --network hng14-stage2-devops_app-network \
+              ${{ secrets.DOCKER_USERNAME }}/hng14-worker:${{ github.sha }}
+
+
+
+            echo "============================================"
+            echo "  Deploy complete for SHA: ${{ github.sha }}"
+            echo "============================================"
+
+          ENDSSH
+
+      # ── Confirm the server is responding after deploy ──────────
+      - name: Verify server is live after deploy
+        run: |
+          echo "Waiting 10s for services to settle..."
+          sleep 10
+          curl -sf http://${{ secrets.SERVER_HOST }}:3000/health \
+            && echo "Server is live and healthy" \
+            || echo "Warning: server did not respond — check the server manually"
