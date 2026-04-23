@@ -36,7 +36,7 @@ jobs:
         run: pip install flake8
 
       - name: flake8 — API
-        run: flake8 app/main.py --max-line-length=100 --extend-ignore=E203
+        run: flake8 api/main.py --max-line-length=100 --extend-ignore=E203
 
       - name: flake8 — Worker
         run: flake8 worker/worker.py --max-line-length=100 --extend-ignore=E203
@@ -95,10 +95,10 @@ jobs:
         run: pip install -r api/tests/requirements-test.txt
 
       - name: Run pytest with coverage
-        # PYTHONPATH=app so `from main import app` resolves without installing the package
+        # PYTHONPATH=api so `from main import app` resolves without installing the package
         run: |
-          PYTHONPATH=app pytest \
-            --cov=app \
+          PYTHONPATH=api pytest \
+            --cov=api \
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
             --cov-report=html:coverage-html \
@@ -141,7 +141,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: app/Dockerfile
+          file: api/Dockerfile
           push: true
           tags: |
             ${{ env.IMAGE_API }}:${{ github.sha }}
@@ -215,7 +215,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: app/Dockerfile
+          file: api/Dockerfile
           load: true
           tags: ${{ env.IMAGE_API }}:${{ steps.sha.outputs.value }}
           cache-from: type=gha
@@ -309,7 +309,7 @@ jobs:
           cat > .env <<EOF
           REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
           REDIS_MAX_MEMORY=64mb
-          APP_ENV=ci
+          API_ENV=cicd
           ALLOWED_ORIGIN=http://localhost:3000
           FRONTEND_PORT=3000
           EOF
@@ -342,7 +342,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: app/Dockerfile
+          file: api/Dockerfile
           load: true
           tags: ${{ env.IMAGE_API }}:${{ steps.sha.outputs.value }}
           cache-from: type=gha
@@ -462,7 +462,7 @@ jobs:
           docker buildx build \
             --load \
             --cache-from type=gha \
-            -f app/Dockerfile \
+            -f api/Dockerfile \
             -t ${{ env.IMAGE_API }}:${{ steps.sha.outputs.value }} \
             -t ${{ env.IMAGE_API }}:latest \
             .
