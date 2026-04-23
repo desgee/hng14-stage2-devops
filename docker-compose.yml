@@ -9,7 +9,7 @@ services:
       --maxmemory-policy allkeys-lru
     restart: unless-stopped
     networks:
-      - internal
+      - app-network
     volumes:
       - redis_data:/data
     healthcheck:
@@ -25,8 +25,7 @@ services:
       dockerfile: api/Dockerfile
     restart: unless-stopped
     networks:
-      - internal
-      - frontend_net
+      - app-network
     environment:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
@@ -49,7 +48,7 @@ services:
       dockerfile: worker/Dockerfile
     restart: unless-stopped
     networks:
-      - internal
+      - app-network
     environment:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
@@ -64,7 +63,7 @@ services:
       dockerfile: frontend/Dockerfile
     restart: unless-stopped
     networks:
-      - frontend_net
+      - app-network
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     environment:
@@ -76,10 +75,7 @@ services:
         condition: service_healthy
 
 networks:
-  internal:
-    driver: bridge
-    internal: true
-  frontend_net:
+  app-network:
     driver: bridge
 
 volumes:
