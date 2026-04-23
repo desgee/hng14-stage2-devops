@@ -67,8 +67,8 @@ jobs:
             -o /usr/local/bin/hadolint
           chmod +x /usr/local/bin/hadolint
 
-      - name: hadolint — app/Dockerfile
-        run: hadolint app/Dockerfile
+      - name: hadolint — api/Dockerfile
+        run: hadolint api/Dockerfile
 
       - name: hadolint — worker/Dockerfile
         run: hadolint worker/Dockerfile
@@ -92,7 +92,7 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
-        run: pip install -r app/tests/requirements-test.txt
+        run: pip install -r api/tests/requirements-test.txt
 
       - name: Run pytest with coverage
         # PYTHONPATH=app so `from main import app` resolves without installing the package
