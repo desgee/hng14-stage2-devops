@@ -1,20 +1,3 @@
-## ============================================================================
-##  CI/CD Pipeline — runs entirely on GitHub's free ubuntu-latest runners
-##
-##  NO server required. NO cloud account required. NO paid services.
-##  Everything — including the rolling deploy — happens inside the runner.
-##
-##  Stages:
-##    1. lint            → flake8, eslint, hadolint
-##    2. test            → pytest (Redis mocked), coverage artifact
-##    3. build           → 3 images built, tagged :<sha> + :latest,
-##                         pushed to local registry:2 service container
-##    4. security-scan   → Trivy, fail on CRITICAL, SARIF artifact
-##    5. integration-test→ full docker compose stack, end-to-end job test
-##    6. deploy          → scripted rolling update on the runner itself
-##                         new container health-checked for 60s before
-##                         old container is stopped
-## ============================================================================
 
 name: CI/CD
 
@@ -55,7 +38,7 @@ jobs:
         run: pip install flake8
 
       - name: flake8 — API
-        run: flake8 app/main.py --max-line-length=100 --extend-ignore=E203
+        run: flake8 api/main.py --max-line-length=100 --extend-ignore=E203
 
       - name: flake8 — Worker
         run: flake8 worker/worker.py --max-line-length=100 --extend-ignore=E203
@@ -87,8 +70,8 @@ jobs:
             -o /usr/local/bin/hadolint
           chmod +x /usr/local/bin/hadolint
 
-      - name: hadolint — app/Dockerfile
-        run: hadolint app/Dockerfile
+      - name: hadolint — api/Dockerfile
+        run: hadolint api/Dockerfile
 
       - name: hadolint — worker/Dockerfile
         run: hadolint worker/Dockerfile
@@ -115,12 +98,12 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
-        run: pip install -r app/tests/requirements-test.txt
+        run: pip install -r api/tests/requirements-test.txt
 
       - name: Run pytest with coverage
         run: |
-          PYTHONPATH=app pytest \
-            --cov=app \
+          PYTHONPATH=api pytest \
+            --cov=api \
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
             --cov-report=html:coverage-html \
@@ -164,7 +147,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: app/Dockerfile
+          file: api/Dockerfile
           push: true
           tags: |
             ${{ env.IMAGE_API }}:${{ github.sha }}
@@ -239,7 +222,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: app/Dockerfile
+          file: api/Dockerfile
           load: true
           tags: ${{ env.IMAGE_API }}:${{ steps.sha.outputs.value }}
           cache-from: type=gha
@@ -362,7 +345,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: app/Dockerfile
+          file: api/Dockerfile
           load: true
           tags: ${{ env.IMAGE_API }}:${{ steps.sha.outputs.value }}
           cache-from: type=gha
@@ -478,7 +461,7 @@ jobs:
         run: |
           docker buildx build \
             --load --cache-from type=gha \
-            -f app/Dockerfile \
+            -f api/Dockerfile \
             -t ${{ env.IMAGE_API }}:${{ steps.sha.outputs.value }} \
             -t ${{ env.IMAGE_API }}:latest \
             .
@@ -565,9 +548,9 @@ jobs:
           echo "Running  : ${RUNNING_IMAGE}"
 
           if [[ "${RUNNING_IMAGE}" == "${EXPECTED}" ]]; then
-            echo "✅ Rolling deploy verified — new image is live."
+            echo "Rolling deploy verified — new image is live."
           else
-            echo "❌ Image mismatch after deploy." >&2
+            echo "Image mismatch after deploy." >&2
             exit 1
           fi
 
