@@ -15,7 +15,7 @@ r = redis.Redis(
     host=os.getenv("REDIS_HOST", "localhost"),
     port=int(os.getenv("REDIS_PORT", 6379)),
     password=os.getenv("REDIS_PASSWORD"),
-    decode_responses=True,  # avoids manual .decode() calls everywhere
+    decode_responses=True,
 )
 
 app.add_middleware(
@@ -40,7 +40,6 @@ def create_job():
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
-
     if not UUID_RE.match(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID format")
 
